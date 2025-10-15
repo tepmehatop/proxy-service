@@ -1,9 +1,12 @@
 import express, { Request, Response } from 'express';
 import axios from 'axios';
 import { URL } from 'url';
+import { createProxyMiddleware } from 'http-proxy-middleware';
+import * as http from 'http';
 
 const app = express();
 const PORT = 3000;
+const server = http.createServer(app);
 
 // ============================================
 // КОНФИГУРАЦИЯ - РЕДАКТИРУЙТЕ ЗДЕСЬ
@@ -398,6 +401,16 @@ app.use('/p/:sessionId', async (req: Request, res: Response) => {
       html = html.replace(/href="\/([^"]*)"/g, `href="http://localhost:${PORT}/p/${sessionId}/$1"`);
       html = html.replace(/src="\/([^"]*)"/g, `src="http://localhost:${PORT}/p/${sessionId}/$1"`);
       html = html.replace(/action="\/([^"]*)"/g, `action="http://localhost:${PORT}/p/${sessionId}/$1"`);
+      html = html.replace(/data-src="\/([^"]*)"/g, `data-src="http://localhost:${PORT}/p/${sessionId}/$1"`);
+
+      // Заменяем в CSS url()
+      html = html.replace(/url\(["']?\/([^"')]+)["']?\)/g, `url("http://localhost:${PORT}/p/${sessionId}/$1")`);
+      html = html.replace(/url\(["']?\.\.\/([^"')]+)["']?\)/g, (match:any, path:any) => {
+        const currentPath = new URL(fullUrl).pathname;
+        const baseDir = currentPath.substring(0, currentPath.lastIndexOf('/'));
+        const parentDir = baseDir.substring(0, baseDir.lastIndexOf('/'));
+        return `url("http://localhost:${PORT}/p/${sessionId}${parentDir}/${path}")`;
+      });
 
       // Добавляем base tag
       const currentPath = new URL(fullUrl).pathname;
@@ -414,9 +427,12 @@ app.use('/p/:sessionId', async (req: Request, res: Response) => {
 (function() {
   const originalFetch = window.fetch;
   const originalOpen = XMLHttpRequest.prototype.open;
+  const originalWebSocket = window.WebSocket;
   const sid = '${sessionId}';
   const base = 'http://localhost:${PORT}/p/' + sid;
   const target = '${targetOrigin}';
+  const wsTarget = target.replace('https://', 'wss://').replace('http://', 'ws://');
+  const wsBase = 'ws://localhost:${PORT}/ws/' + sid;
   
   function fixUrl(url) {
     if (!url || url.startsWith('data:') || url.startsWith('blob:')) return url;
@@ -428,6 +444,12 @@ app.use('/p/:sessionId', async (req: Request, res: Response) => {
       const d = p.substring(0, p.lastIndexOf('/') + 1);
       return base + d + url;
     }
+    return url;
+  }
+  
+  function fixWsUrl(url) {
+    if (url.startsWith(wsTarget)) return url.replace(wsTarget, wsBase);
+    if (url.startsWith('/')) return wsBase + url;
     return url;
   }
   
@@ -444,6 +466,13 @@ app.use('/p/:sessionId', async (req: Request, res: Response) => {
     for (let i = 2; i < arguments.length; i++) args.push(arguments[i]);
     return originalOpen.apply(this, args);
   };
+  
+  window.WebSocket = function(url, protocols) {
+    const fixed = fixWsUrl(url);
+    console.log('WebSocket:', url, '->', fixed);
+    return new originalWebSocket(fixed, protocols);
+  };
+  window.WebSocket.prototype = originalWebSocket.prototype;
 })();
 </script>`;
 
@@ -458,6 +487,45 @@ app.use('/p/:sessionId', async (req: Request, res: Response) => {
       const targetOrigin = new URL(session.targetUrl).origin;
       content = content.split(targetOrigin).join(`http://localhost:${PORT}/p/${sessionId}`);
       return res.status(response.status).send(content);
+    }
+
+    // Обработка CSS
+    if (contentType.includes('text/css')) {
+      let css = response.data.toString('utf-8');
+      const targetOrigin = new URL(session.targetUrl).origin;
+
+      // Заменяем абсолютные URL в CSS
+      css = css.split(targetOrigin).join(`http://localhost:${PORT}/p/${sessionId}`);
+
+      // Заменяем относительные url() в CSS
+      css = css.replace(/url\(["']?\/([^"')]+)["']?\)/g, `url("http://localhost:${PORT}/p/${sessionId}/$1")`);
+      css = css.replace(/url\(["']?\.\.\/([^"')]+)["']?\)/g, (match:any, path:any) => {
+        const currentPath = new URL(fullUrl).pathname;
+        const baseDir = currentPath.substring(0, currentPath.lastIndexOf('/'));
+        const parentDir = baseDir.substring(0, baseDir.lastIndexOf('/'));
+        return `url("http://localhost:${PORT}/p/${sessionId}${parentDir}/${path}")`;
+      });
+      css = css.replace(/url\(["']?\.\/([^"')]+)["']?\)/g, (match:any, path:any) => {
+        const currentPath = new URL(fullUrl).pathname;
+        const baseDir = currentPath.substring(0, currentPath.lastIndexOf('/'));
+        return `url("http://localhost:${PORT}/p/${sessionId}${baseDir}/${path}")`;
+      });
+
+      return res.status(response.status).send(css);
+    }
+
+    // Обработка шрифтов и изображений - отправляем как есть
+    if (contentType.includes('font') ||
+        contentType.includes('woff') ||
+        contentType.includes('ttf') ||
+        contentType.includes('image') ||
+        contentType.includes('png') ||
+        contentType.includes('jpg') ||
+        contentType.includes('jpeg') ||
+        contentType.includes('gif') ||
+        contentType.includes('svg') ||
+        contentType.includes('ico')) {
+      return res.status(response.status).send(response.data);
     }
 
     // Все остальное
@@ -478,14 +546,80 @@ app.use('/p/:sessionId', async (req: Request, res: Response) => {
   }
 });
 
+// WebSocket прокси
+server.on('upgrade', (request, socket, head) => {
+  const urlParts = request.url?.split('/');
+  if (!urlParts || urlParts[1] !== 'ws' || !urlParts[2]) {
+    socket.destroy();
+    return;
+  }
+
+  const sessionId = urlParts[2];
+  const session = sessions.get(sessionId);
+
+  if (!session) {
+    socket.destroy();
+    return;
+  }
+
+  // Получаем путь WebSocket
+  const wsPath = '/' + urlParts.slice(3).join('/');
+  const targetUrl = new URL(session.targetUrl);
+  const wsProtocol = targetUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsTarget = `${wsProtocol}//${targetUrl.host}${wsPath}`;
+
+  console.log(`🔌 WebSocket: ${wsTarget}`);
+
+  // Создаем WebSocket клиент к целевому серверу
+  const WebSocket = require('ws');
+  const ws = new WebSocket(wsTarget, {
+    headers: {
+      'Authorization': session.token,
+      'Origin': targetUrl.origin,
+      'User-Agent': request.headers['user-agent']
+    }
+  });
+
+  ws.on('open', () => {
+    console.log('✅ WebSocket соединение установлено');
+  });
+
+  ws.on('message', (data: any) => {
+    socket.write(data);
+  });
+
+  ws.on('close', () => {
+    socket.end();
+  });
+
+  ws.on('error', (err: Error) => {
+    console.error('❌ WebSocket ошибка:', err.message);
+    socket.destroy();
+  });
+
+  socket.on('data', (data) => {
+    ws.send(data);
+  });
+
+  socket.on('close', () => {
+    ws.close();
+  });
+
+  socket.on('error', (err) => {
+    console.error('❌ Socket ошибка:', err.message);
+    ws.close();
+  });
+});
+
 // Запуск
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log('\n╔════════════════════════════════════════╗');
   console.log('║     🚀 PROXY SERVICE ЗАПУЩЕН 🚀      ║');
   console.log('╚════════════════════════════════════════╝\n');
   console.log(`📍 Откройте: \x1b[36mhttp://localhost:${PORT}\x1b[0m\n`);
   console.log('📋 Конфигурация:');
   console.log(`   Стендов: ${Object.keys(STAND_URLS).length}`);
-  console.log(`   Пользователей: ${Object.keys(USER_TOKENS).length}\n`);
+  console.log(`   Пользователей: ${Object.keys(USER_TOKENS).length}`);
+  console.log(`   WebSocket: Включен\n`);
   console.log('Для остановки нажмите Ctrl+C\n');
 });
