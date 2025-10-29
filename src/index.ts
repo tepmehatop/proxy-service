@@ -457,7 +457,13 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
       validateStatus: () => true,
       maxRedirects: 5,
       timeout: 30000,
-      decompress: false
+      decompress: false,
+      proxy: false,
+      httpAgent: new (require('http').Agent)({ keepAlive: true }),
+      httpsAgent: new (require('https').Agent)({
+        keepAlive: true,
+        rejectUnauthorized: false
+      })
     });
 
     console.log(`✅ ${response.status} ${response.statusText}`);
@@ -508,13 +514,17 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
       let html = response.data.toString('utf-8');
       const targetOrigin = new URL(session.targetUrl).origin;
 
+      // Замена абсолютных URL с доменом
       html = html.split(targetOrigin).join(`${proxyBase}/p/${sessionId}`);
 
+      // Замена относительных путей с /
       html = html.replace(/href="\/([^"]*)"/g, `href="${proxyBase}/p/${sessionId}/$1"`);
       html = html.replace(/src="\/([^"]*)"/g, `src="${proxyBase}/p/${sessionId}/$1"`);
       html = html.replace(/action="\/([^"]*)"/g, `action="${proxyBase}/p/${sessionId}/$1"`);
       html = html.replace(/data-src="\/([^"]*)"/g, `data-src="${proxyBase}/p/${sessionId}/$1"`);
+      html = html.replace(/srcset="\/([^"]*)"/g, `srcset="${proxyBase}/p/${sessionId}/$1"`);
 
+      // Замена в inline стилях
       html = html.replace(/url\("\/([^"]+)"\)/g, (match: string, path: string) => {
         return `url("${proxyBase}/p/${sessionId}/${path}")`;
       });
@@ -523,6 +533,18 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
       });
       html = html.replace(/url\(\/([^)]+)\)/g, (match: string, path: string) => {
         return `url(${proxyBase}/p/${sessionId}/${path})`;
+      });
+
+      // Замена путей без слеша (например: static/main.js)
+      html = html.replace(/src="(?!http|\/\/|data:|#)([^"]+)"/g, (match: string, path: string) => {
+        return `src="${proxyBase}/p/${sessionId}/${path}"`;
+      });
+      html = html.replace(/href="(?!http|\/\/|data:|#|mailto:|javascript:)([^"]+)"/g, (match: string, path: string) => {
+        // Не заменяем якоря и специальные ссылки
+        if (path.startsWith('#') || path.startsWith('javascript:') || path.startsWith('mailto:')) {
+          return match;
+        }
+        return `href="${proxyBase}/p/${sessionId}/${path}"`;
       });
 
       const currentPath = new URL(fullUrl).pathname;
@@ -554,20 +576,44 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
       if (!url || typeof url !== 'string') return url;
       if (url.startsWith('data:') || url.startsWith('blob:')) return url;
       if (url.startsWith(base)) return url;
+      
+      // Абсолютные URL с доменом
       if (url.startsWith(target)) {
         const fixed = url.replace(target, base);
         return fixed;
       }
+      
+      // Абсолютные пути с /
       if (url.startsWith('/')) return base + url;
+      
+      // Относительные пути (static/main.js, ./assets/style.css, ../images/logo.png)
       if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('//')) {
         try {
-          const p = window.location.pathname;
-          const d = p.substring(0, p.lastIndexOf('/') + 1);
-          return base + d + url;
+          // Убираем query параметры для определения base path
+          const currentPathname = window.location.pathname;
+          const basePath = currentPathname.substring(0, currentPathname.lastIndexOf('/') + 1);
+          
+          // Обработка ../
+          if (url.startsWith('../')) {
+            const parts = basePath.split('/').filter(p => p);
+            parts.pop(); // Удаляем последнюю папку
+            const newBase = '/' + parts.join('/') + '/';
+            return base + newBase + url.substring(3);
+          }
+          
+          // Обработка ./
+          if (url.startsWith('./')) {
+            return base + basePath + url.substring(2);
+          }
+          
+          // Простой относительный путь
+          return base + basePath + url;
         } catch (e) {
+          console.error('Error fixing relative URL:', url, e);
           return url;
         }
       }
+      
       return url;
     }
     
@@ -671,43 +717,113 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('❌ Ошибка прокси:', error.message);
     console.error('   URL:', fullUrl);
+    console.error('   Метод:', req.method);
     console.error('   Код:', error.code);
 
     if (error.response) {
       console.error('   Статус:', error.response.status);
-      console.error('   Данные:', error.response.data?.toString().substring(0, 200));
+      console.error('   Заголовки:', error.response.headers);
     }
 
-    // Возвращаем более информативную ошибку
+    // Специфичные сообщения для разных ошибок
+    let errorMessage = error.message;
+    let errorHint = '';
+
+    if (error.code === 'ECONNREFUSED') {
+      errorMessage = 'Не удалось подключиться к целевому серверу';
+      errorHint = `Проверьте, что сервер ${session.targetUrl} доступен и работает. Возможно, нужно указать порт в конфигурации STAND_URLS.`;
+    } else if (error.code === 'ENOTFOUND') {
+      errorMessage = 'Домен не найден';
+      errorHint = `Проверьте правильность URL в конфигурации: ${session.targetUrl}`;
+    } else if (error.code === 'ETIMEDOUT') {
+      errorMessage = 'Превышено время ожидания';
+      errorHint = 'Целевой сервер не отвечает. Попробуйте позже.';
+    } else if (error.code === 'ECONNRESET') {
+      errorMessage = 'Соединение сброшено сервером';
+      errorHint = 'Целевой сервер разорвал соединение.';
+    }
+
     const errorPage = `
       <html>
         <head>
           <meta charset="UTF-8">
           <style>
-            body { font-family: Arial; padding: 50px; background: #f5f5f5; }
-            .error { background: white; padding: 30px; border-radius: 10px; max-width: 600px; margin: 0 auto; }
-            h1 { color: #e74c3c; }
-            .details { background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 15px 0; }
-            code { background: #e9ecef; padding: 2px 6px; border-radius: 3px; }
-            a { color: #667eea; text-decoration: none; }
-            a:hover { text-decoration: underline; }
+            body { 
+              font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+              padding: 50px; 
+              background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+              min-height: 100vh;
+              margin: 0;
+            }
+            .error { 
+              background: white; 
+              padding: 40px; 
+              border-radius: 15px; 
+              max-width: 700px; 
+              margin: 0 auto;
+              box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            }
+            h1 { 
+              color: #e74c3c; 
+              margin-bottom: 20px;
+            }
+            .details { 
+              background: #f8f9fa; 
+              padding: 20px; 
+              border-radius: 8px; 
+              margin: 20px 0;
+              border-left: 4px solid #e74c3c;
+            }
+            .details p {
+              margin: 10px 0;
+            }
+            code { 
+              background: #e9ecef; 
+              padding: 3px 8px; 
+              border-radius: 4px;
+              font-family: 'Courier New', monospace;
+              font-size: 14px;
+              word-break: break-all;
+            }
+            .hint {
+              background: #fff3cd;
+              border-left: 4px solid #ffc107;
+              padding: 15px;
+              border-radius: 8px;
+              margin: 20px 0;
+            }
+            a { 
+              display: inline-block;
+              margin-top: 20px;
+              color: white;
+              background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+              padding: 12px 24px;
+              border-radius: 8px;
+              text-decoration: none;
+              transition: transform 0.2s;
+            }
+            a:hover { 
+              transform: translateY(-2px);
+            }
           </style>
         </head>
         <body>
           <div class="error">
-            <h1>❌ Ошибка прокси</h1>
+            <h1>❌ ${errorMessage}</h1>
+            ${errorHint ? `<div class="hint"><strong>💡 Подсказка:</strong> ${errorHint}</div>` : ''}
             <div class="details">
-              <p><strong>Сообщение:</strong> ${error.message}</p>
-              <p><strong>URL:</strong> <code>${fullUrl}</code></p>
-              ${error.code ? `<p><strong>Код:</strong> ${error.code}</p>` : ''}
-              ${error.response ? `<p><strong>Статус:</strong> ${error.response.status}</p>` : ''}
+              <p><strong>Целевой URL:</strong> <code>${fullUrl}</code></p>
+              <p><strong>Метод:</strong> <code>${req.method}</code></p>
+              ${error.code ? `<p><strong>Код ошибки:</strong> <code>${error.code}</code></p>` : ''}
+              ${error.response ? `<p><strong>HTTP статус:</strong> <code>${error.response.status}</code></p>` : ''}
+              <p><strong>Базовый URL стенда:</strong> <code>${session.targetUrl}</code></p>
             </div>
-            <p><a href="/">← Вернуться на главную</a></p>
+            <a href="/">← Вернуться на главную</a>
           </div>
         </body>
       </html>
     `;
-    res.status(error.response?.status || 500).send(errorPage);
+    res.status(error.response?.status || 502).send(errorPage);
   }
 });
 
