@@ -1,12 +1,9 @@
 import express, { Request, Response } from 'express';
 import axios from 'axios';
 import { URL } from 'url';
-import * as http from 'http';
-import * as crypto from 'crypto';
 
 const app = express();
 const PORT = 3000;
-const server = http.createServer(app);
 
 // ============================================
 // КОНФИГУРАЦИЯ - РЕДАКТИРУЙТЕ ЗДЕСЬ
@@ -61,93 +58,6 @@ const sessions = new Map<string, Session>();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// ============================================
-// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ WEBSOCKET
-// ============================================
-
-function generateAcceptValue(key: string): string {
-  return crypto
-      .createHash('sha1')
-      .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
-      .digest('base64');
-}
-
-function encodeWebSocketFrame(data: Buffer | string, isBinary: boolean = false): Buffer {
-  const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const length = payload.length;
-  let frame: Buffer;
-
-  const opcode = isBinary ? 0x82 : 0x81;
-
-  if (length < 126) {
-    frame = Buffer.allocUnsafe(2 + length);
-    frame[0] = opcode;
-    frame[1] = length;
-    payload.copy(frame, 2);
-  } else if (length < 65536) {
-    frame = Buffer.allocUnsafe(4 + length);
-    frame[0] = opcode;
-    frame[1] = 126;
-    frame.writeUInt16BE(length, 2);
-    payload.copy(frame, 4);
-  } else {
-    frame = Buffer.allocUnsafe(10 + length);
-    frame[0] = opcode;
-    frame[1] = 127;
-    frame.writeUInt32BE(0, 2);
-    frame.writeUInt32BE(length, 6);
-    payload.copy(frame, 10);
-  }
-
-  return frame;
-}
-
-function parseWebSocketFrames(data: Buffer): Array<{opcode: number, payload: Buffer}> {
-  const frames: Array<{opcode: number, payload: Buffer}> = [];
-  let offset = 0;
-
-  while (offset < data.length) {
-    if (data.length - offset < 2) break;
-
-    const opcode = data[offset] & 0x0f;
-    const isMasked = (data[offset + 1] & 0x80) === 0x80;
-    let payloadLength = data[offset + 1] & 0x7f;
-    let headerSize = 2;
-
-    if (payloadLength === 126) {
-      if (data.length - offset < 4) break;
-      payloadLength = data.readUInt16BE(offset + 2);
-      headerSize = 4;
-    } else if (payloadLength === 127) {
-      if (data.length - offset < 10) break;
-      payloadLength = data.readUInt32BE(offset + 6);
-      headerSize = 10;
-    }
-
-    if (isMasked) {
-      if (data.length - offset < headerSize + 4 + payloadLength) break;
-      const maskingKey = data.slice(offset + headerSize, offset + headerSize + 4);
-      const payload = Buffer.allocUnsafe(payloadLength);
-      for (let i = 0; i < payloadLength; i++) {
-        payload[i] = data[offset + headerSize + 4 + i] ^ maskingKey[i % 4];
-      }
-      frames.push({ opcode, payload });
-      offset += headerSize + 4 + payloadLength;
-    } else {
-      if (data.length - offset < headerSize + payloadLength) break;
-      const payload = data.slice(offset + headerSize, offset + headerSize + payloadLength);
-      frames.push({ opcode, payload });
-      offset += headerSize + payloadLength;
-    }
-  }
-
-  return frames;
-}
-
-// ============================================
-// МАРШРУТЫ
-// ============================================
 
 // Главная страница
 app.get('/', (req: Request, res: Response) => {
@@ -386,17 +296,16 @@ app.post('/create-session', (req: Request, res: Response) => {
 
   res.json({ success: true, proxyUrl: `/p/${sessionId}/` });
 });
-
-// Прокси для HTTP запросов
-app.options('/p/:sessionId*', (req: Request, res: Response) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Access-Control-Max-Age', '86400');
-  res.status(200).end();
-});
-
-app.use('/p/:sessionId*', async (req: Request, res: Response) => {
+// // Прокси для HTTP запросов
+// app.options('/p/:sessionId*', (req: Request, res: Response) => {
+//   res.setHeader('Access-Control-Allow-Origin', '*');
+//   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+//   res.setHeader('Access-Control-Allow-Headers', '*');
+//   res.setHeader('Access-Control-Max-Age', '86400');
+//   res.status(200).end();
+// });
+// Прокси - ИСПРАВЛЕНА ОБРАБОТКА ПУТЕЙ
+app.all('/p/:sessionId*', async (req: Request, res: Response) => {
   const sessionId = req.params.sessionId;
   const session = sessions.get(sessionId);
 
@@ -411,41 +320,32 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
     `);
   }
 
-  const fullPath = req.params[0] || '/';
-  const queryString = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
-  const path = fullPath + queryString;
+  // ИСПРАВЛЕНИЕ: правильное извлечение пути
+  // req.params[0] содержит всё после /p/:sessionId включая /
+  const pathAfterSession = req.params[0] || '';
+  const fullPath = pathAfterSession.startsWith('/') ? pathAfterSession : '/' + pathAfterSession;
 
-  const fullUrl = session.targetUrl + path;
+  const fullUrl = session.targetUrl + fullPath;
   console.log(`📡 ${req.method} ${fullUrl}`);
-
-  // Получаем текущий хост (для работы на удалённом сервере)
-  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-  const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${PORT}`;
-  const proxyBase = `${protocol}://${host}`;
-  const wsProtocol = protocol === 'https' ? 'wss' : 'ws';
-  const wsBase = `${wsProtocol}://${host}`;
-
-  console.log(`🌐 Proxy Base: ${proxyBase}`);
 
   try {
     const headers: any = {
       'Authorization': session.token,
       'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
-      'Accept': req.headers['accept'] || '*/*',
-      'Accept-Encoding': 'identity'
+      'Accept': req.headers['accept'] || '*/*'
+      // 'Accept-Encoding': 'identity'
     };
 
     if (req.headers['accept-language']) headers['Accept-Language'] = req.headers['accept-language'];
     if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type'];
     if (req.headers['cookie']) headers['Cookie'] = req.headers['cookie'];
-    if (req.headers['referer']) {
-      // Заменяем referer на целевой домен
-      headers['Referer'] = session.targetUrl;
-    }
-    if (req.headers['origin']) {
-      headers['Origin'] = new URL(session.targetUrl).origin;
-    }
-
+    // if (req.headers['referer']) {
+    //   // Заменяем referer на целевой домен
+    //   headers['Referer'] = session.targetUrl;
+    // }
+    // if (req.headers['origin']) {
+    //   headers['Origin'] = new URL(session.targetUrl).origin;
+    // }
     console.log(`🔑 Authorization: ${session.token.substring(0, 30)}...`);
 
     const response = await axios({
@@ -455,15 +355,8 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
       data: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
       responseType: 'arraybuffer',
       validateStatus: () => true,
-      maxRedirects: 5,
-      timeout: 30000,
-      decompress: false,
-      proxy: false,
-      httpAgent: new (require('http').Agent)({ keepAlive: true }),
-      httpsAgent: new (require('https').Agent)({
-        keepAlive: true,
-        rejectUnauthorized: false
-      })
+      maxRedirects: 0,
+      timeout: 30000
     });
 
     console.log(`✅ ${response.status} ${response.statusText}`);
@@ -503,9 +396,6 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', '*');
-    res.setHeader('Cross-Origin-Embedder-Policy', 'unsafe-none');
-    res.setHeader('Cross-Origin-Opener-Policy', 'unsafe-none');
-    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 
     const contentType = response.headers['content-type'] || '';
 
@@ -514,167 +404,59 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
       let html = response.data.toString('utf-8');
       const targetOrigin = new URL(session.targetUrl).origin;
 
-      // Замена абсолютных URL с доменом
-      html = html.split(targetOrigin).join(`${proxyBase}/p/${sessionId}`);
+      // Заменяем абсолютные URL
+      html = html.split(targetOrigin).join(`http://localhost:${PORT}/p/${sessionId}`);
 
-      // Замена относительных путей с /
-      html = html.replace(/href="\/([^"]*)"/g, `href="${proxyBase}/p/${sessionId}/$1"`);
-      html = html.replace(/src="\/([^"]*)"/g, `src="${proxyBase}/p/${sessionId}/$1"`);
-      html = html.replace(/action="\/([^"]*)"/g, `action="${proxyBase}/p/${sessionId}/$1"`);
-      html = html.replace(/data-src="\/([^"]*)"/g, `data-src="${proxyBase}/p/${sessionId}/$1"`);
-      html = html.replace(/srcset="\/([^"]*)"/g, `srcset="${proxyBase}/p/${sessionId}/$1"`);
+      // Заменяем относительные пути с /
+      html = html.replace(/href="\/([^"]*)"/g, `href="http://localhost:${PORT}/p/${sessionId}/$1"`);
+      html = html.replace(/src="\/([^"]*)"/g, `src="http://localhost:${PORT}/p/${sessionId}/$1"`);
+      html = html.replace(/action="\/([^"]*)"/g, `action="http://localhost:${PORT}/p/${sessionId}/$1"`);
 
-      // Замена в inline стилях
-      html = html.replace(/url\("\/([^"]+)"\)/g, (match: string, path: string) => {
-        return `url("${proxyBase}/p/${sessionId}/${path}")`;
-      });
-      html = html.replace(/url\('\/([^']+)'\)/g, (match: string, path: string) => {
-        return `url('${proxyBase}/p/${sessionId}/${path}')`;
-      });
-      html = html.replace(/url\(\/([^)]+)\)/g, (match: string, path: string) => {
-        return `url(${proxyBase}/p/${sessionId}/${path})`;
-      });
-
-      // Замена путей без слеша (например: static/main.js)
-      html = html.replace(/src="(?!http|\/\/|data:|#)([^"]+)"/g, (match: string, path: string) => {
-        return `src="${proxyBase}/p/${sessionId}/${path}"`;
-      });
-      html = html.replace(/href="(?!http|\/\/|data:|#|mailto:|javascript:)([^"]+)"/g, (match: string, path: string) => {
-        // Не заменяем якоря и специальные ссылки
-        if (path.startsWith('#') || path.startsWith('javascript:') || path.startsWith('mailto:')) {
-          return match;
-        }
-        return `href="${proxyBase}/p/${sessionId}/${path}"`;
-      });
-
+      // Добавляем base tag для корректной работы
       const currentPath = new URL(fullUrl).pathname;
       const baseDir = currentPath.substring(0, currentPath.lastIndexOf('/') + 1);
-      const baseHref = `${proxyBase}/p/${sessionId}${baseDir}`;
+      const baseHref = `http://localhost:${PORT}/p/${sessionId}${baseDir}`;
 
       if (html.indexOf('<base') === -1) {
         html = html.replace('<head>', `<head><base href="${baseHref}">`);
       }
 
+      // Инжектим скрипт перехвата
       const script = `
 <script>
 (function() {
-  try {
-    const originalFetch = window.fetch;
-    const originalOpen = XMLHttpRequest.prototype.open;
-    const originalWebSocket = window.WebSocket;
-    const sid = '${sessionId}';
-    const base = '${proxyBase}/p/' + sid;
-    const target = '${targetOrigin}';
-    const wsBase = '${wsBase}/ws/' + sid;
-    
-    console.log('🔧 Proxy инициализирован');
-    console.log('   Base:', base);
-    console.log('   Target:', target);
-    console.log('   WS Base:', wsBase);
-    
-    function fixUrl(url) {
-      if (!url || typeof url !== 'string') return url;
-      if (url.startsWith('data:') || url.startsWith('blob:')) return url;
-      if (url.startsWith(base)) return url;
-      
-      // Абсолютные URL с доменом
-      if (url.startsWith(target)) {
-        const fixed = url.replace(target, base);
-        return fixed;
-      }
-      
-      // Абсолютные пути с /
-      if (url.startsWith('/')) return base + url;
-      
-      // Относительные пути (static/main.js, ./assets/style.css, ../images/logo.png)
-      if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('//')) {
-        try {
-          // Убираем query параметры для определения base path
-          const currentPathname = window.location.pathname;
-          const basePath = currentPathname.substring(0, currentPathname.lastIndexOf('/') + 1);
-          
-          // Обработка ../
-          if (url.startsWith('../')) {
-            const parts = basePath.split('/').filter(p => p);
-            parts.pop(); // Удаляем последнюю папку
-            const newBase = '/' + parts.join('/') + '/';
-            return base + newBase + url.substring(3);
-          }
-          
-          // Обработка ./
-          if (url.startsWith('./')) {
-            return base + basePath + url.substring(2);
-          }
-          
-          // Простой относительный путь
-          return base + basePath + url;
-        } catch (e) {
-          console.error('Error fixing relative URL:', url, e);
-          return url;
-        }
-      }
-      
-      return url;
+  const originalFetch = window.fetch;
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const sid = '${sessionId}';
+  const base = 'http://localhost:${PORT}/p/' + sid;
+  const target = '${targetOrigin}';
+  
+  function fixUrl(url) {
+    if (!url || url.startsWith('data:') || url.startsWith('blob:')) return url;
+    if (url.startsWith(base)) return url;
+    if (url.startsWith(target)) return url.replace(target, base);
+    if (url.startsWith('/')) return base + url;
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      const p = window.location.pathname;
+      const d = p.substring(0, p.lastIndexOf('/') + 1);
+      return base + d + url;
     }
-    
-    window.fetch = function(url, opts) {
-      try {
-        const fixed = fixUrl(url);
-        if (fixed !== url) {
-          console.log('Fetch:', url, '->', fixed);
-        }
-        return originalFetch(fixed, opts || {});
-      } catch (e) {
-        console.error('Fetch error:', e);
-        return originalFetch(url, opts || {});
-      }
-    };
-    
-    XMLHttpRequest.prototype.open = function(method, url) {
-      try {
-        const fixed = fixUrl(url);
-        if (fixed !== url) {
-          console.log('XHR:', url, '->', fixed);
-        }
-        const args = [method, fixed];
-        for (let i = 2; i < arguments.length; i++) args.push(arguments[i]);
-        return originalOpen.apply(this, args);
-      } catch (e) {
-        console.error('XHR error:', e);
-        return originalOpen.apply(this, arguments);
-      }
-    };
-    
-    window.WebSocket = function(url, protocols) {
-      try {
-        let fixed = url;
-        if (typeof url === 'string') {
-          if (url.startsWith('ws://') || url.startsWith('wss://')) {
-            const wsUrl = new URL(url.replace('ws://', 'http://').replace('wss://', 'https://'));
-            fixed = wsBase + wsUrl.pathname + wsUrl.search;
-          } else if (url.startsWith('/')) {
-            fixed = wsBase + url;
-          }
-          if (fixed !== url) {
-            console.log('WebSocket:', url, '->', fixed);
-          }
-        }
-        return new originalWebSocket(fixed, protocols);
-      } catch (e) {
-        console.error('WebSocket error:', e);
-        return new originalWebSocket(url, protocols);
-      }
-    };
-    window.WebSocket.prototype = originalWebSocket.prototype;
-    window.WebSocket.CONNECTING = originalWebSocket.CONNECTING;
-    window.WebSocket.OPEN = originalWebSocket.OPEN;
-    window.WebSocket.CLOSING = originalWebSocket.CLOSING;
-    window.WebSocket.CLOSED = originalWebSocket.CLOSED;
-    
-    console.log('✅ Proxy готов');
-  } catch (e) {
-    console.error('❌ Ошибка инициализации proxy:', e);
+    return url;
   }
+  
+  window.fetch = function(url, opts) {
+    const fixed = fixUrl(url);
+    console.log('Fetch:', url, '->', fixed);
+    return originalFetch(fixed, opts || {});
+  };
+  
+  XMLHttpRequest.prototype.open = function(method, url) {
+    const fixed = fixUrl(url);
+    console.log('XHR:', url, '->', fixed);
+    const args = [method, fixed];
+    for (let i = 2; i < arguments.length; i++) args.push(arguments[i]);
+    return originalOpen.apply(this, args);
+  };
 })();
 </script>`;
 
@@ -687,223 +469,36 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
     if (contentType.includes('javascript') || contentType.includes('json')) {
       let content = response.data.toString('utf-8');
       const targetOrigin = new URL(session.targetUrl).origin;
-      content = content.split(targetOrigin).join(`${proxyBase}/p/${sessionId}`);
+      content = content.split(targetOrigin).join(`http://localhost:${PORT}/p/${sessionId}`);
       return res.status(response.status).send(content);
-    }
-
-    // Обработка CSS
-    if (contentType.includes('text/css')) {
-      let css = response.data.toString('utf-8');
-      const targetOrigin = new URL(session.targetUrl).origin;
-
-      css = css.split(targetOrigin).join(`${proxyBase}/p/${sessionId}`);
-
-      css = css.replace(/url\("\/([^"]+)"\)/g, (match: string, path: string) => {
-        return `url("${proxyBase}/p/${sessionId}/${path}")`;
-      });
-      css = css.replace(/url\('\/([^']+)'\)/g, (match: string, path: string) => {
-        return `url('${proxyBase}/p/${sessionId}/${path}')`;
-      });
-      css = css.replace(/url\(\/([^)]+)\)/g, (match: string, path: string) => {
-        return `url(${proxyBase}/p/${sessionId}/${path})`;
-      });
-
-      return res.status(response.status).send(css);
     }
 
     // Все остальное
     res.status(response.status).send(response.data);
 
   } catch (error: any) {
-    console.error('❌ Ошибка прокси:', error.message);
-    console.error('   URL:', fullUrl);
-    console.error('   Метод:', req.method);
-    console.error('   Код:', error.code);
-
-    if (error.response) {
-      console.error('   Статус:', error.response.status);
-      console.error('   Заголовки:', error.response.headers);
-    }
-
-    // Специфичные сообщения для разных ошибок
-    let errorMessage = error.message;
-    let errorHint = '';
-
-    if (error.code === 'ECONNREFUSED') {
-      errorMessage = 'Не удалось подключиться к целевому серверу';
-      errorHint = `Проверьте, что сервер ${session.targetUrl} доступен и работает. Возможно, нужно указать порт в конфигурации STAND_URLS.`;
-    } else if (error.code === 'ENOTFOUND') {
-      errorMessage = 'Домен не найден';
-      errorHint = `Проверьте правильность URL в конфигурации: ${session.targetUrl}`;
-    } else if (error.code === 'ETIMEDOUT') {
-      errorMessage = 'Превышено время ожидания';
-      errorHint = 'Целевой сервер не отвечает. Попробуйте позже.';
-    } else if (error.code === 'ECONNRESET') {
-      errorMessage = 'Соединение сброшено сервером';
-      errorHint = 'Целевой сервер разорвал соединение.';
-    }
-
+    console.error('❌ Ошибка:', error.message);
     const errorPage = `
       <html>
-        <head>
-          <meta charset="UTF-8">
-          <style>
-            body { 
-              font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-              padding: 50px; 
-              background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-              min-height: 100vh;
-              margin: 0;
-            }
-            .error { 
-              background: white; 
-              padding: 40px; 
-              border-radius: 15px; 
-              max-width: 700px; 
-              margin: 0 auto;
-              box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            }
-            h1 { 
-              color: #e74c3c; 
-              margin-bottom: 20px;
-            }
-            .details { 
-              background: #f8f9fa; 
-              padding: 20px; 
-              border-radius: 8px; 
-              margin: 20px 0;
-              border-left: 4px solid #e74c3c;
-            }
-            .details p {
-              margin: 10px 0;
-            }
-            code { 
-              background: #e9ecef; 
-              padding: 3px 8px; 
-              border-radius: 4px;
-              font-family: 'Courier New', monospace;
-              font-size: 14px;
-              word-break: break-all;
-            }
-            .hint {
-              background: #fff3cd;
-              border-left: 4px solid #ffc107;
-              padding: 15px;
-              border-radius: 8px;
-              margin: 20px 0;
-            }
-            a { 
-              display: inline-block;
-              margin-top: 20px;
-              color: white;
-              background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-              padding: 12px 24px;
-              border-radius: 8px;
-              text-decoration: none;
-              transition: transform 0.2s;
-            }
-            a:hover { 
-              transform: translateY(-2px);
-            }
-          </style>
-        </head>
-        <body>
-          <div class="error">
-            <h1>❌ ${errorMessage}</h1>
-            ${errorHint ? `<div class="hint"><strong>💡 Подсказка:</strong> ${errorHint}</div>` : ''}
-            <div class="details">
-              <p><strong>Целевой URL:</strong> <code>${fullUrl}</code></p>
-              <p><strong>Метод:</strong> <code>${req.method}</code></p>
-              ${error.code ? `<p><strong>Код ошибки:</strong> <code>${error.code}</code></p>` : ''}
-              ${error.response ? `<p><strong>HTTP статус:</strong> <code>${error.response.status}</code></p>` : ''}
-              <p><strong>Базовый URL стенда:</strong> <code>${session.targetUrl}</code></p>
-            </div>
-            <a href="/">← Вернуться на главную</a>
-          </div>
+        <body style="font-family: Arial; text-align: center; padding: 50px;">
+          <h1>❌ Ошибка прокси</h1>
+          <p>${error.message}</p>
+          <p><a href="/">Вернуться на главную</a></p>
         </body>
       </html>
     `;
-    res.status(error.response?.status || 502).send(errorPage);
+    res.status(500).send(errorPage);
   }
-});
-
-// WebSocket прокси
-server.on('upgrade', (request, socket, head) => {
-  console.log(`\n🔌 WebSocket запрос: ${request.url}`);
-
-  const urlParts = request.url?.split('/');
-  if (!urlParts || urlParts[1] !== 'ws' || !urlParts[2]) {
-    console.error('❌ WebSocket: Неверный формат URL');
-    socket.destroy();
-    return;
-  }
-
-  const sessionId = urlParts[2];
-  const session = sessions.get(sessionId);
-
-  if (!session) {
-    socket.destroy();
-    return;
-  }
-
-  // Получаем путь WebSocket
-  const wsPath = '/' + urlParts.slice(3).join('/');
-  const targetUrl = new URL(session.targetUrl);
-  const wsProtocol = targetUrl.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsTarget = `${wsProtocol}//${targetUrl.host}${wsPath}`;
-
-  console.log(`🔌 WebSocket: ${wsTarget}`);
-
-  // Создаем WebSocket клиент к целевому серверу
-  const WebSocket = require('ws');
-  const ws = new WebSocket(wsTarget, {
-    headers: {
-      'Authorization': session.token,
-      'Origin': targetUrl.origin,
-      'User-Agent': request.headers['user-agent']
-    }
-  });
-
-  ws.on('open', () => {
-    console.log('✅ WebSocket соединение установлено');
-  });
-
-  ws.on('message', (data: any) => {
-    socket.write(data);
-  });
-
-  ws.on('close', () => {
-    socket.end();
-  });
-
-  ws.on('error', (err: Error) => {
-    console.error('❌ WebSocket ошибка:', err.message);
-    socket.destroy();
-  });
-
-  socket.on('data', (data) => {
-    ws.send(data);
-  });
-
-  socket.on('close', () => {
-    ws.close();
-  });
-
-  socket.on('error', (err) => {
-    console.error('❌ Socket ошибка:', err.message);
-    ws.close();
-  });
 });
 
 // Запуск
-server.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log('\n╔════════════════════════════════════════╗');
   console.log('║     🚀 PROXY SERVICE ЗАПУЩЕН 🚀      ║');
   console.log('╚════════════════════════════════════════╝\n');
   console.log(`📍 Откройте: \x1b[36mhttp://localhost:${PORT}\x1b[0m\n`);
   console.log('📋 Конфигурация:');
   console.log(`   Стендов: ${Object.keys(STAND_URLS).length}`);
-  console.log(`   Пользователей: ${Object.keys(USER_TOKENS).length}`);
-  console.log(`   WebSocket: Включен\n`);
+  console.log(`   Пользователей: ${Object.keys(USER_TOKENS).length}\n`);
   console.log('Для остановки нажмите Ctrl+C\n');
 });
