@@ -388,6 +388,14 @@ app.post('/create-session', (req: Request, res: Response) => {
 });
 
 // Прокси для HTTP запросов
+app.options('/p/:sessionId*', (req: Request, res: Response) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  res.status(200).end();
+});
+
 app.use('/p/:sessionId*', async (req: Request, res: Response) => {
   const sessionId = req.params.sessionId;
   const session = sessions.get(sessionId);
@@ -424,7 +432,7 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
       'Authorization': session.token,
       'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
       'Accept': req.headers['accept'] || '*/*',
-      'Accept-Encoding': 'gzip, deflate, br'
+      'Accept-Encoding': 'identity'
     };
 
     if (req.headers['accept-language']) headers['Accept-Language'] = req.headers['accept-language'];
@@ -447,8 +455,9 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
       data: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
       responseType: 'arraybuffer',
       validateStatus: () => true,
-      maxRedirects: 0,
-      timeout: 30000
+      maxRedirects: 5,
+      timeout: 30000,
+      decompress: false
     });
 
     console.log(`✅ ${response.status} ${response.statusText}`);
@@ -527,57 +536,99 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
       const script = `
 <script>
 (function() {
-  const originalFetch = window.fetch;
-  const originalOpen = XMLHttpRequest.prototype.open;
-  const originalWebSocket = window.WebSocket;
-  const sid = '${sessionId}';
-  const base = '${proxyBase}/p/' + sid;
-  const target = '${targetOrigin}';
-  const wsBase = '${wsBase}/ws/' + sid;
-  
-  function fixUrl(url) {
-    if (!url || url.startsWith('data:') || url.startsWith('blob:')) return url;
-    if (url.startsWith(base)) return url;
-    if (url.startsWith(target)) return url.replace(target, base);
-    if (url.startsWith('/')) return base + url;
-    if (!url.startsWith('http://') && !url.startsWith('https://')) {
-      const p = window.location.pathname;
-      const d = p.substring(0, p.lastIndexOf('/') + 1);
-      return base + d + url;
+  try {
+    const originalFetch = window.fetch;
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalWebSocket = window.WebSocket;
+    const sid = '${sessionId}';
+    const base = '${proxyBase}/p/' + sid;
+    const target = '${targetOrigin}';
+    const wsBase = '${wsBase}/ws/' + sid;
+    
+    console.log('🔧 Proxy инициализирован');
+    console.log('   Base:', base);
+    console.log('   Target:', target);
+    console.log('   WS Base:', wsBase);
+    
+    function fixUrl(url) {
+      if (!url || typeof url !== 'string') return url;
+      if (url.startsWith('data:') || url.startsWith('blob:')) return url;
+      if (url.startsWith(base)) return url;
+      if (url.startsWith(target)) {
+        const fixed = url.replace(target, base);
+        return fixed;
+      }
+      if (url.startsWith('/')) return base + url;
+      if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('//')) {
+        try {
+          const p = window.location.pathname;
+          const d = p.substring(0, p.lastIndexOf('/') + 1);
+          return base + d + url;
+        } catch (e) {
+          return url;
+        }
+      }
+      return url;
     }
-    return url;
+    
+    window.fetch = function(url, opts) {
+      try {
+        const fixed = fixUrl(url);
+        if (fixed !== url) {
+          console.log('Fetch:', url, '->', fixed);
+        }
+        return originalFetch(fixed, opts || {});
+      } catch (e) {
+        console.error('Fetch error:', e);
+        return originalFetch(url, opts || {});
+      }
+    };
+    
+    XMLHttpRequest.prototype.open = function(method, url) {
+      try {
+        const fixed = fixUrl(url);
+        if (fixed !== url) {
+          console.log('XHR:', url, '->', fixed);
+        }
+        const args = [method, fixed];
+        for (let i = 2; i < arguments.length; i++) args.push(arguments[i]);
+        return originalOpen.apply(this, args);
+      } catch (e) {
+        console.error('XHR error:', e);
+        return originalOpen.apply(this, arguments);
+      }
+    };
+    
+    window.WebSocket = function(url, protocols) {
+      try {
+        let fixed = url;
+        if (typeof url === 'string') {
+          if (url.startsWith('ws://') || url.startsWith('wss://')) {
+            const wsUrl = new URL(url.replace('ws://', 'http://').replace('wss://', 'https://'));
+            fixed = wsBase + wsUrl.pathname + wsUrl.search;
+          } else if (url.startsWith('/')) {
+            fixed = wsBase + url;
+          }
+          if (fixed !== url) {
+            console.log('WebSocket:', url, '->', fixed);
+          }
+        }
+        return new originalWebSocket(fixed, protocols);
+      } catch (e) {
+        console.error('WebSocket error:', e);
+        return new originalWebSocket(url, protocols);
+      }
+    };
+    window.WebSocket.prototype = originalWebSocket.prototype;
+    window.WebSocket.CONNECTING = originalWebSocket.CONNECTING;
+    window.WebSocket.OPEN = originalWebSocket.OPEN;
+    window.WebSocket.CLOSING = originalWebSocket.CLOSING;
+    window.WebSocket.CLOSED = originalWebSocket.CLOSED;
+    
+    console.log('✅ Proxy готов');
+  } catch (e) {
+    console.error('❌ Ошибка инициализации proxy:', e);
   }
-  
-  window.fetch = function(url, opts) {
-    const fixed = fixUrl(url);
-    console.log('Fetch:', url, '->', fixed);
-    return originalFetch(fixed, opts || {});
-  };
-  
-  XMLHttpRequest.prototype.open = function(method, url) {
-    const fixed = fixUrl(url);
-    console.log('XHR:', url, '->', fixed);
-    const args = [method, fixed];
-    for (let i = 2; i < arguments.length; i++) args.push(arguments[i]);
-    return originalOpen.apply(this, args);
-  };
-  
-  window.WebSocket = function(url, protocols) {
-    let fixed = url;
-    if (url.startsWith('ws://') || url.startsWith('wss://')) {
-      const wsUrl = new URL(url.replace('ws://', 'http://').replace('wss://', 'https://'));
-      fixed = wsBase + wsUrl.pathname + wsUrl.search;
-    } else if (url.startsWith('/')) {
-      fixed = wsBase + url;
-    }
-    console.log('WebSocket:', url, '->', fixed);
-    return new originalWebSocket(fixed, protocols);
-  };
-  window.WebSocket.prototype = originalWebSocket.prototype;
-  window.WebSocket.CONNECTING = originalWebSocket.CONNECTING;
-  window.WebSocket.OPEN = originalWebSocket.OPEN;
-  window.WebSocket.CLOSING = originalWebSocket.CLOSING;
-  window.WebSocket.CLOSED = originalWebSocket.CLOSED;
 })();
 </script>`;
 
@@ -618,24 +669,55 @@ app.use('/p/:sessionId*', async (req: Request, res: Response) => {
     res.status(response.status).send(response.data);
 
   } catch (error: any) {
-    console.error('❌ Ошибка:', error.message);
+    console.error('❌ Ошибка прокси:', error.message);
+    console.error('   URL:', fullUrl);
+    console.error('   Код:', error.code);
+
+    if (error.response) {
+      console.error('   Статус:', error.response.status);
+      console.error('   Данные:', error.response.data?.toString().substring(0, 200));
+    }
+
+    // Возвращаем более информативную ошибку
     const errorPage = `
       <html>
-        <body style="font-family: Arial; text-align: center; padding: 50px;">
-          <h1>❌ Ошибка прокси</h1>
-          <p>${error.message}</p>
-          <p><a href="/">Вернуться на главную</a></p>
+        <head>
+          <meta charset="UTF-8">
+          <style>
+            body { font-family: Arial; padding: 50px; background: #f5f5f5; }
+            .error { background: white; padding: 30px; border-radius: 10px; max-width: 600px; margin: 0 auto; }
+            h1 { color: #e74c3c; }
+            .details { background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 15px 0; }
+            code { background: #e9ecef; padding: 2px 6px; border-radius: 3px; }
+            a { color: #667eea; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+          </style>
+        </head>
+        <body>
+          <div class="error">
+            <h1>❌ Ошибка прокси</h1>
+            <div class="details">
+              <p><strong>Сообщение:</strong> ${error.message}</p>
+              <p><strong>URL:</strong> <code>${fullUrl}</code></p>
+              ${error.code ? `<p><strong>Код:</strong> ${error.code}</p>` : ''}
+              ${error.response ? `<p><strong>Статус:</strong> ${error.response.status}</p>` : ''}
+            </div>
+            <p><a href="/">← Вернуться на главную</a></p>
+          </div>
         </body>
       </html>
     `;
-    res.status(500).send(errorPage);
+    res.status(error.response?.status || 500).send(errorPage);
   }
 });
 
 // WebSocket прокси
 server.on('upgrade', (request, socket, head) => {
+  console.log(`\n🔌 WebSocket запрос: ${request.url}`);
+
   const urlParts = request.url?.split('/');
   if (!urlParts || urlParts[1] !== 'ws' || !urlParts[2]) {
+    console.error('❌ WebSocket: Неверный формат URL');
     socket.destroy();
     return;
   }
