@@ -292,6 +292,14 @@ app.post('/create-session', (req, res) => {
 });
 
 // Прокси
+app.options('/p/:sid/*', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  res.status(204).end();
+});
+
 app.all('/p/:sid/*', async (req, res) => {
   const sid = req.params.sid;
   const session = sessions.get(sid);
@@ -328,6 +336,9 @@ app.all('/p/:sid/*', async (req, res) => {
     if (req.headers['cookie']) {
       headers['Cookie'] = req.headers['cookie'];
     }
+    if (req.headers['referer']) {
+      headers['Referer'] = session.targetUrl;
+    }
 
     const response = await axios({
       method: req.method as any,
@@ -336,7 +347,7 @@ app.all('/p/:sid/*', async (req, res) => {
       data: req.body,
       responseType: 'arraybuffer',
       validateStatus: () => true,
-      maxRedirects: 0,
+      maxRedirects: 5,
       timeout: 30000
     });
 
@@ -352,7 +363,8 @@ app.all('/p/:sid/*', async (req, res) => {
 
     // Копируем заголовки
     const skip = ['content-encoding', 'transfer-encoding', 'connection',
-      'content-security-policy', 'x-frame-options'];
+      'content-security-policy', 'x-frame-options',
+      'content-security-policy-report-only'];
 
     for (const key in response.headers) {
       if (!skip.includes(key.toLowerCase())) {
@@ -364,7 +376,19 @@ app.all('/p/:sid/*', async (req, res) => {
       }
     }
 
+    // Добавляем CORS заголовки
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'unsafe-none');
+
     const ct = response.headers['content-type'] || '';
+
+    // Определяем хост динамически для Docker
+    const protocol = req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http');
+    const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${PORT}`;
+    const proxyBase = `${protocol}://${host}`;
 
     // HTML
     if (ct.includes('text/html')) {
@@ -372,15 +396,19 @@ app.all('/p/:sid/*', async (req, res) => {
       const origin = new URL(session.targetUrl).origin;
 
       // Замена абсолютных URL
-      html = html.split(origin).join(`http://localhost:${PORT}/p/${sid}`);
+      html = html.split(origin).join(`${proxyBase}/p/${sid}`);
 
       // Замена относительных путей
-      html = html.replace(/href="\/([^"]*)"/g, `href="http://localhost:${PORT}/p/${sid}/$1"`);
-      html = html.replace(/src="\/([^"]*)"/g, `src="http://localhost:${PORT}/p/${sid}/$1"`);
-      html = html.replace(/action="\/([^"]*)"/g, `action="http://localhost:${PORT}/p/${sid}/$1"`);
+      html = html.replace(/href="\/([^"]*)"/g, `href="${proxyBase}/p/${sid}/$1"`);
+      html = html.replace(/src="\/([^"]*)"/g, `src="${proxyBase}/p/${sid}/$1"`);
+      html = html.replace(/action="\/([^"]*)"/g, `action="${proxyBase}/p/${sid}/$1"`);
+      html = html.replace(/srcset="\/([^"]*)"/g, `srcset="${proxyBase}/p/${sid}/$1"`);
+
+      // Замена url() в inline стилях
+      html = html.replace(/url\(['"]?\/([^'")\s]+)['"]?\)/g, `url("${proxyBase}/p/${sid}/$1")`);
 
       // Base tag
-      const base = `http://localhost:${PORT}/p/${sid}/`;
+      const base = `${proxyBase}/p/${sid}/`;
       if (!html.includes('<base')) {
         html = html.replace('<head>', `<head><base href="${base}">`);
       }
@@ -392,7 +420,7 @@ app.all('/p/:sid/*', async (req, res) => {
   const orig_fetch = window.fetch;
   const orig_xhr = XMLHttpRequest.prototype.open;
   const sid = '${sid}';
-  const base = 'http://localhost:${PORT}/p/' + sid;
+  const base = '${proxyBase}/p/' + sid;
   const target = '${origin}';
   
   function fix(url) {
@@ -425,12 +453,34 @@ app.all('/p/:sid/*', async (req, res) => {
       return res.status(response.status).send(html);
     }
 
+    // CSS
+    if (ct.includes('text/css')) {
+      let css = response.data.toString('utf-8');
+      const origin = new URL(session.targetUrl).origin;
+
+      // Замена абсолютных URL
+      css = css.split(origin).join(`${proxyBase}/p/${sid}`);
+
+      // Замена url() в CSS
+      css = css.replace(/url\(['"]?\/([^'")\s]+)['"]?\)/g, `url("${proxyBase}/p/${sid}/$1")`);
+
+      return res.status(response.status).send(css);
+    }
+
     // JS/JSON
     if (ct.includes('javascript') || ct.includes('json')) {
       let content = response.data.toString('utf-8');
       const origin = new URL(session.targetUrl).origin;
-      content = content.split(origin).join(`http://localhost:${PORT}/p/${sid}`);
+      content = content.split(origin).join(`${proxyBase}/p/${sid}`);
       return res.status(response.status).send(content);
+    }
+
+    // Шрифты и изображения (бинарные данные)
+    if (ct.includes('font') || ct.includes('woff') || ct.includes('ttf') ||
+        ct.includes('image') || ct.includes('png') || ct.includes('jpg') ||
+        ct.includes('jpeg') || ct.includes('svg') || ct.includes('gif') ||
+        ct.includes('ico') || ct.includes('webp')) {
+      return res.status(response.status).send(response.data);
     }
 
     // Остальное
