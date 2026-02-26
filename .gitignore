@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.js.map
+.env
+.env.*
+.DS_Store
+.idea/
+*.iml
+sessions.json

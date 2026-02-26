@@ -1,5 +1,6 @@
 import express from 'express';
 import axios from 'axios';
+import fs from 'fs';
 
 const app = express();
 const PORT = 3000;
@@ -12,6 +13,7 @@ app.use(express.urlencoded({ extended: true }));
 // ============================================
 
 const STAND_URLS: Record<string, string> = {
+  mock: 'http://localhost:4000',
   test: 'https://test.example.com',
   dev: 'https://dev.example.com',
   load: 'https://load.example.com'
@@ -50,9 +52,43 @@ const USER_TOKENS: Record<string, Record<string, string>> = {
 interface Session {
   targetUrl: string;
   token: string;
+  user: string;
+  role: string;
+  stand: string;
+  createdAt: number;
 }
 
-const sessions = new Map<string, Session>();
+const SESSIONS_FILE = './sessions.json';
+const SESSION_TTL = 10 * 24 * 60 * 60 * 1000; // 10 дней
+
+function loadSessions(): Map<string, Session> {
+  try {
+    const raw = fs.readFileSync(SESSIONS_FILE, 'utf-8');
+    const data: Record<string, Session> = JSON.parse(raw);
+    const now = Date.now();
+    const map = new Map<string, Session>();
+    for (const [sid, s] of Object.entries(data)) {
+      if (now - s.createdAt < SESSION_TTL) {
+        map.set(sid, s);
+      }
+    }
+    console.log(`📂 Загружено сессий: ${map.size}`);
+    return map;
+  } catch {
+    return new Map<string, Session>();
+  }
+}
+
+function saveSessions() {
+  try {
+    const obj = Object.fromEntries(sessions);
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) {
+    console.error('⚠️ Не удалось сохранить сессии:', e);
+  }
+}
+
+const sessions = loadSessions();
 
 // Главная страница
 app.get('/', (req, res) => {
@@ -159,6 +195,7 @@ app.get('/', (req, res) => {
         <label for="stand">Стенд:</label>
         <select id="stand" required>
           <option value="">Выберите стенд</option>
+          <option value="mock">Mock (localhost:4000)</option>
           <option value="test">Тест</option>
           <option value="dev">Разработка</option>
           <option value="load">Нагрузка</option>
@@ -279,7 +316,8 @@ app.post('/create-session', (req, res) => {
   const sid = Math.random().toString(36).substr(2, 9) +
       Math.random().toString(36).substr(2, 9);
 
-  sessions.set(sid, { targetUrl, token });
+  sessions.set(sid, { targetUrl, token, user, role, stand, createdAt: Date.now() });
+  saveSessions();
 
   console.log(`\n✅ Сессия создана:`);
   console.log(`   ID: ${sid}`);
@@ -315,8 +353,9 @@ app.all('/p/:sid/*', async (req, res) => {
     `);
   }
 
-  const path = req.path.replace(`/p/${sid}`, '');
-  const url = session.targetUrl + path;
+  // req.url содержит путь + query string, req.path — только путь
+  const fullPath = req.url.replace(`/p/${sid}`, '');
+  const url = session.targetUrl + fullPath;
 
   console.log(`📡 ${req.method} ${url}`);
 
@@ -407,9 +446,9 @@ app.all('/p/:sid/*', async (req, res) => {
       // Замена url() в inline стилях
       html = html.replace(/url\(['"]?\/([^'")\s]+)['"]?\)/g, `url("${proxyBase}/p/${sid}/$1")`);
 
-      // Base tag
+      // Base tag — используем regex чтобы не ловить '<base' внутри JS-кода/комментариев
       const base = `${proxyBase}/p/${sid}/`;
-      if (!html.includes('<base')) {
+      if (!/<base[\s>]/i.test(html)) {
         html = html.replace('<head>', `<head><base href="${base}">`);
       }
 
@@ -419,33 +458,84 @@ app.all('/p/:sid/*', async (req, res) => {
 (function() {
   const orig_fetch = window.fetch;
   const orig_xhr = XMLHttpRequest.prototype.open;
+  const orig_pushState = history.pushState;
+  const orig_replaceState = history.replaceState;
   const sid = '${sid}';
   const base = '${proxyBase}/p/' + sid;
   const target = '${origin}';
-  
+
+  // basePath = /p/{sid} (без trailing slash)
+  const basePath = new URL(base).pathname;
+
+  // Override Location.prototype.pathname чтобы SPA-роутеры видели чистый путь
+  // (/products/1 вместо /p/{sid}/products/1) при обновлении страницы.
+  // Это основной фикс для работы pushState-роутеров через прокси.
+  try {
+    const _origProp = Object.getOwnPropertyDescriptor(Location.prototype, 'pathname');
+    if (_origProp && _origProp.configurable) {
+      Object.defineProperty(Location.prototype, 'pathname', {
+        configurable: true,
+        get: function() {
+          const val = _origProp.get.call(this);
+          if (val === basePath || val.startsWith(basePath + '/')) {
+            return val.slice(basePath.length) || '/';
+          }
+          return val;
+        }
+      });
+    }
+  } catch(e) {}
+
   function fix(url) {
     if (!url) return url;
-    if (url.startsWith('data:') || url.startsWith('blob:')) return url;
+    url = String(url);
+    if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('mailto:') || url.startsWith('#')) return url;
     if (url.startsWith(base)) return url;
     if (url.startsWith(target)) return url.replace(target, base);
     if (url.startsWith('/')) return base + url;
     if (!url.startsWith('http')) {
-      const p = location.pathname;
-      const d = p.substring(0, p.lastIndexOf('/') + 1);
-      return base + d + url;
+      try {
+        // location.href не переопределён — возвращает полный proxied URL
+        // (http://host/p/{sid}/products/1), что корректно для разрешения относительных путей
+        const resolved = new URL(url, location.href).href;
+        if (resolved.startsWith(base)) return resolved;
+        if (resolved.startsWith(target)) return resolved.replace(target, base);
+        return resolved;
+      } catch(e) { return url; }
     }
     return url;
   }
-  
-  window.fetch = function(url, opts) {
-    return orig_fetch(fix(url), opts);
+
+  // Fix A: перехват SPA-навигации (history.pushState / replaceState)
+  history.pushState = function(state, title, url) {
+    return orig_pushState.call(this, state, title, url ? fix(url) : url);
   };
-  
+  history.replaceState = function(state, title, url) {
+    return orig_replaceState.call(this, state, title, url ? fix(url) : url);
+  };
+
+  // Fix B: перехват fetch
+  window.fetch = function(url, opts) {
+    return orig_fetch.call(this, fix(url), opts);
+  };
+
+  // Fix C: перехват XHR
   XMLHttpRequest.prototype.open = function(method, url) {
     const args = Array.prototype.slice.call(arguments);
     args[1] = fix(url);
     return orig_xhr.apply(this, args);
   };
+
+  // Fix D: перехват кликов по ссылкам (для динамически созданных ссылок с абсолютными URL)
+  document.addEventListener('click', function(e) {
+    const a = e.target.closest('a');
+    if (!a || !a.href || e.defaultPrevented) return;
+    const fixed = fix(a.href);
+    if (fixed !== a.href) {
+      e.preventDefault();
+      location.href = fixed;
+    }
+  }, false);
 })();
 </script>`;
 
