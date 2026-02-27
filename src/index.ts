@@ -467,32 +467,17 @@ app.all('/p/:sid/*', async (req, res) => {
   // basePath = /p/{sid} (без trailing slash)
   const basePath = new URL(base).pathname;
 
-  // Override Location.prototype.pathname чтобы SPA-роутеры видели чистый путь
-  // (/products/1 вместо /p/{sid}/products/1) при обновлении страницы.
-  // Это основной фикс для работы pushState-роутеров через прокси.
-  try {
-    const _origProp = Object.getOwnPropertyDescriptor(Location.prototype, 'pathname');
-    if (_origProp && _origProp.configurable) {
-      Object.defineProperty(Location.prototype, 'pathname', {
-        configurable: true,
-        get: function() {
-          const val = _origProp.get.call(this);
-          if (val === basePath || val.startsWith(basePath + '/')) {
-            return val.slice(basePath.length) || '/';
-          }
-          return val;
-        }
-      });
-    }
-  } catch(e) {}
-
   function fix(url) {
     if (!url) return url;
     url = String(url);
     if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('mailto:') || url.startsWith('#')) return url;
     if (url.startsWith(base)) return url;
     if (url.startsWith(target)) return url.replace(target, base);
-    if (url.startsWith('/')) return base + url;
+    if (url.startsWith('/')) {
+      // Фреймворк (Angular, Vue Router) уже добавил basePath из тега <base> — не дублируем
+      if (url === basePath || url.startsWith(basePath + '/')) return url;
+      return base + url;
+    }
     if (!url.startsWith('http')) {
       try {
         // location.href не переопределён — возвращает полный proxied URL
