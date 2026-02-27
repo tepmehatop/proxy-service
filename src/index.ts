@@ -458,14 +458,9 @@ app.all('/p/:sid/*', async (req, res) => {
 (function() {
   const orig_fetch = window.fetch;
   const orig_xhr = XMLHttpRequest.prototype.open;
-  const orig_pushState = history.pushState;
-  const orig_replaceState = history.replaceState;
   const sid = '${sid}';
   const base = '${proxyBase}/p/' + sid;
   const target = '${origin}';
-
-  // basePath = /p/{sid} (без trailing slash)
-  const basePath = new URL(base).pathname;
 
   function fix(url) {
     if (!url) return url;
@@ -473,15 +468,9 @@ app.all('/p/:sid/*', async (req, res) => {
     if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('mailto:') || url.startsWith('#')) return url;
     if (url.startsWith(base)) return url;
     if (url.startsWith(target)) return url.replace(target, base);
-    if (url.startsWith('/')) {
-      // Фреймворк (Angular, Vue Router) уже добавил basePath из тега <base> — не дублируем
-      if (url === basePath || url.startsWith(basePath + '/')) return url;
-      return base + url;
-    }
+    if (url.startsWith('/')) return base + url;
     if (!url.startsWith('http')) {
       try {
-        // location.href не переопределён — возвращает полный proxied URL
-        // (http://host/p/{sid}/products/1), что корректно для разрешения относительных путей
         const resolved = new URL(url, location.href).href;
         if (resolved.startsWith(base)) return resolved;
         if (resolved.startsWith(target)) return resolved.replace(target, base);
@@ -491,36 +480,15 @@ app.all('/p/:sid/*', async (req, res) => {
     return url;
   }
 
-  // Fix A: перехват SPA-навигации (history.pushState / replaceState)
-  history.pushState = function(state, title, url) {
-    return orig_pushState.call(this, state, title, url ? fix(url) : url);
-  };
-  history.replaceState = function(state, title, url) {
-    return orig_replaceState.call(this, state, title, url ? fix(url) : url);
-  };
-
-  // Fix B: перехват fetch
   window.fetch = function(url, opts) {
     return orig_fetch.call(this, fix(url), opts);
   };
 
-  // Fix C: перехват XHR
   XMLHttpRequest.prototype.open = function(method, url) {
     const args = Array.prototype.slice.call(arguments);
     args[1] = fix(url);
     return orig_xhr.apply(this, args);
   };
-
-  // Fix D: перехват кликов по ссылкам (для динамически созданных ссылок с абсолютными URL)
-  document.addEventListener('click', function(e) {
-    const a = e.target.closest('a');
-    if (!a || !a.href || e.defaultPrevented) return;
-    const fixed = fix(a.href);
-    if (fixed !== a.href) {
-      e.preventDefault();
-      location.href = fixed;
-    }
-  }, false);
 })();
 </script>`;
 
