@@ -90,6 +90,16 @@ function saveSessions() {
 
 const sessions = loadSessions();
 
+function getProxySid(cookieHeader?: string): string | null {
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() === 'proxy-sid') return part.slice(eq + 1).trim() || null;
+  }
+  return null;
+}
+
 // Главная страница
 app.get('/', (req, res) => {
   const users = Object.keys(USER_TOKENS);
@@ -326,6 +336,12 @@ app.post('/create-session', (req, res) => {
   console.log(`   Стенд: ${stand}`);
   console.log(`   URL: ${targetUrl}\n`);
 
+  res.cookie('proxy-sid', sid, {
+    maxAge: Math.floor(SESSION_TTL / 1000),
+    path: '/',
+    sameSite: 'lax',
+    httpOnly: false
+  });
   res.json({ url: `/p/${sid}/` });
 });
 
@@ -541,6 +557,16 @@ app.all('/p/:sid/*', async (req, res) => {
       </html>
     `);
   }
+});
+
+// Catch-all: восстановление сессии по cookie при refresh/дубликате вкладки
+app.all('*', (req, res) => {
+  const sid = getProxySid(req.headers['cookie']);
+  if (sid && sessions.has(sid)) {
+    console.log(`🔄 Редирект ${req.url} → /p/${sid}${req.url}`);
+    return res.redirect(302, `/p/${sid}${req.url}`);
+  }
+  return res.redirect(302, '/');
 });
 
 // Запуск
