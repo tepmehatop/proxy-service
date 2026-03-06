@@ -474,17 +474,41 @@ app.all('/p/:sid/*', async (req, res) => {
 (function() {
   const orig_fetch = window.fetch;
   const orig_xhr = XMLHttpRequest.prototype.open;
+  const orig_pushState = history.pushState;
+  const orig_replaceState = history.replaceState;
   const sid = '${sid}';
   const base = '${proxyBase}/p/' + sid;
   const target = '${origin}';
   const prefix = '/p/' + sid;
 
-  // Убираем proxy prefix из location.pathname чтобы SPA-роутер видел обычные пути (/orders/ вместо /p/sid/orders/)
-  var curPath = location.pathname;
-  if (curPath.startsWith(prefix)) {
-    var realPath = curPath.slice(prefix.length) || '/';
-    history.replaceState(history.state, document.title, realPath + location.search + location.hash);
+  // Патчим location.pathname — SPA-роутер читает его при инициализации и навигации.
+  // Возвращаем путь без proxy prefix: /orders/ вместо /p/sid/orders/.
+  // location.href при этом остаётся полным — fix() корректно резолвит относительные URL.
+  try {
+    Object.defineProperty(Location.prototype, 'pathname', {
+      get: function() {
+        var path = new URL(this.href).pathname;
+        return path.startsWith(prefix) ? (path.slice(prefix.length) || '/') : path;
+      },
+      configurable: true
+    });
+  } catch(e) {}
+
+  // Перехватываем pushState/replaceState: SPA передаёт короткий путь (/orders/),
+  // добавляем prefix чтобы URL в браузере оставался шарабельным (/p/sid/orders/).
+  function withPrefix(url) {
+    if (!url) return url;
+    url = String(url);
+    if (url.startsWith('/') && !url.startsWith(prefix)) return prefix + url;
+    return url;
   }
+
+  history.pushState = function(state, title, url) {
+    return orig_pushState.call(this, state, title, withPrefix(url));
+  };
+  history.replaceState = function(state, title, url) {
+    return orig_replaceState.call(this, state, title, withPrefix(url));
+  };
 
   function fix(url) {
     if (!url) return url;
