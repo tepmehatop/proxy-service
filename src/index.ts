@@ -477,6 +477,14 @@ app.all('/p/:sid/*', async (req, res) => {
   const sid = '${sid}';
   const base = '${proxyBase}/p/' + sid;
   const target = '${origin}';
+  const prefix = '/p/' + sid;
+
+  // Убираем proxy prefix из location.pathname чтобы SPA-роутер видел обычные пути (/orders/ вместо /p/sid/orders/)
+  var curPath = location.pathname;
+  if (curPath.startsWith(prefix)) {
+    var realPath = curPath.slice(prefix.length) || '/';
+    history.replaceState(history.state, document.title, realPath + location.search + location.hash);
+  }
 
   function fix(url) {
     if (!url) return url;
