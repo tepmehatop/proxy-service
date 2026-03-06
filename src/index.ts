@@ -481,33 +481,36 @@ app.all('/p/:sid/*', async (req, res) => {
   const target = '${origin}';
   const prefix = '/p/' + sid;
 
-  // Патчим location.pathname — SPA-роутер читает его при инициализации и навигации.
-  // Возвращаем путь без proxy prefix: /orders/ вместо /p/sid/orders/.
-  // location.href при этом остаётся полным — fix() корректно резолвит относительные URL.
-  try {
-    Object.defineProperty(Location.prototype, 'pathname', {
-      get: function() {
-        var path = new URL(this.href).pathname;
-        return path.startsWith(prefix) ? (path.slice(prefix.length) || '/') : path;
-      },
-      configurable: true
-    });
-  } catch(e) {}
+  // Убираем proxy prefix из pathname и добавляем ?_s=sid в query.
+  // SPA-роутер видит /orders/, а ?_s=sid делает URL шарабельным:
+  // получатель открывает /orders/?_s=sid → сервер редиректит на /p/sid/orders/ → работает.
+  var curPath = location.pathname;
+  if (curPath.startsWith(prefix)) {
+    var realPath = curPath.slice(prefix.length) || '/';
+    try {
+      var u = new URL('http://x' + realPath + location.search + location.hash);
+      u.searchParams.set('_s', sid);
+      orig_replaceState.call(history, history.state, document.title, u.pathname + u.search + u.hash);
+    } catch(e) {}
+  }
 
-  // Перехватываем pushState/replaceState: SPA передаёт короткий путь (/orders/),
-  // добавляем prefix чтобы URL в браузере оставался шарабельным (/p/sid/orders/).
-  function withPrefix(url) {
+  // Перехватываем pushState/replaceState: добавляем ?_s=sid чтобы URL оставался шарабельным.
+  function withSid(url) {
     if (!url) return url;
     url = String(url);
-    if (url.startsWith('/') && !url.startsWith(prefix)) return prefix + url;
-    return url;
+    if (!url.startsWith('/')) return url;
+    try {
+      var u = new URL('http://x' + url);
+      u.searchParams.set('_s', sid);
+      return u.pathname + u.search + u.hash;
+    } catch(e) { return url; }
   }
 
   history.pushState = function(state, title, url) {
-    return orig_pushState.call(this, state, title, withPrefix(url));
+    return orig_pushState.call(this, state, title, withSid(url));
   };
   history.replaceState = function(state, title, url) {
-    return orig_replaceState.call(this, state, title, withPrefix(url));
+    return orig_replaceState.call(this, state, title, withSid(url));
   };
 
   function fix(url) {
@@ -591,8 +594,18 @@ app.all('/p/:sid/*', async (req, res) => {
   }
 });
 
-// Catch-all: восстановление сессии по cookie при refresh/дубликате вкладки
+// Catch-all: восстановление сессии по query ?_s= (шарабельные ссылки) или cookie (refresh/дубликат)
 app.all('*', (req, res) => {
+  // Шарабельная ссылка: /orders/?_s=sid → редиректим на /p/sid/orders/
+  const sidFromQuery = req.query['_s'] as string;
+  if (sidFromQuery && sessions.has(sidFromQuery)) {
+    const url = new URL(`http://x${req.url}`);
+    url.searchParams.delete('_s');
+    const remainingQuery = url.search;
+    console.log(`🔗 Shared link → /p/${sidFromQuery}${req.path}${remainingQuery}`);
+    return res.redirect(302, `/p/${sidFromQuery}${req.path}${remainingQuery}`);
+  }
+  // Cookie: обычный refresh или дубликат вкладки
   const sid = getProxySid(req.headers['cookie']);
   if (sid && sessions.has(sid)) {
     console.log(`🔄 Редирект ${req.url} → /p/${sid}${req.url}`);
